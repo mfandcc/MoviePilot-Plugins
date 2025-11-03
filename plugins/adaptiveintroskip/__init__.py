@@ -5,9 +5,10 @@ from app.core.event import eventmanager, Event
 from app.plugins import _PluginBase
 from app.schemas import WebhookEventInfo
 from app.schemas.types import EventType
-from .skip_helper import *
+from .skip_helper import EmbySkipHelper, include_keyword, exclude_keyword
 from app.log import logger
 from app.core.meta import MetaBase
+from app.helper.mediaserver import MediaServerHelper
 
 handle_threading = []
 lock = threading.Lock()
@@ -22,7 +23,7 @@ class AdaptiveIntroSkip(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/honue/MoviePilot-Plugins/main/icons/chapter.png"
     # 插件版本
-    plugin_version = "1.7.7"
+    plugin_version = "1.7.8"
     # 插件作者
     plugin_author = "honue"
     # 作者主页
@@ -41,8 +42,19 @@ class AdaptiveIntroSkip(_PluginBase):
     _include: str = ''
     _exclude: str = ''
     _spec = ''
+    _mediaserver_helper = None
+    _mediaservers = None
+    _mediaserver = None
+    _skip_helper: EmbySkipHelper = None
 
     def init_plugin(self, config: dict = None):
+        # mediaserver helper
+        self._mediaserver_helper = MediaServerHelper()
+        self._mediaservers = []
+        self._mediaserver = None
+        # 初始化 skip_helper 实例
+        self._skip_helper = EmbySkipHelper()
+        
         if config:
             self._enable = config.get("enable") or False
             self._user = config.get("user") or ""
@@ -53,6 +65,25 @@ class AdaptiveIntroSkip(_PluginBase):
             self._exclude = config.get("exclude") or ''
             # 特别指定开始 结束时间
             self._spec = config.get("spec") or ''
+            # 媒体服务器选择
+            self._mediaservers = config.get("mediaservers") or []
+            if self._mediaservers:
+                # keep single selection behavior similar to mediawarp
+                self._mediaserver = [self._mediaservers[0]]
+
+        # 如果选择了媒体服务器，解析并设置到 skip_helper
+        if self._mediaserver:
+            emby_servers = self._mediaserver_helper.get_services(name_filters=self._mediaserver)
+            for _, emby_server in emby_servers.items():
+                emby_host = emby_server.config.config.get("host")
+                emby_apikey = emby_server.config.config.get("apikey")
+                # normalize host
+                if emby_host.endswith("/"):
+                    emby_host = emby_host.rstrip("/")
+                if not emby_host.startswith("http"):
+                    emby_host = "http://" + emby_host
+                # Configure skip_helper with selected server
+                self._skip_helper.set_emby_server(emby_host, emby_apikey)
 
     @eventmanager.register(EventType.WebhookMessage)
     def hook(self, event: Event):
@@ -98,9 +129,10 @@ class AdaptiveIntroSkip(_PluginBase):
 
         # 当前正在播放集的信息
         current_percentage = event_info.percentage
-        current_video_item_id = get_current_video_item_id(item_id=event_info.item_id, season_id=event_info.season_id,
-                                                          episode_id=event_info.episode_id)
-        total_sec = get_total_time(current_video_item_id)
+        current_video_item_id = self._skip_helper.get_current_video_item_id(item_id=event_info.item_id, 
+                                                                             season_id=event_info.season_id,
+                                                                             episode_id=event_info.episode_id)
+        total_sec = self._skip_helper.get_total_time(current_video_item_id)
         current_sec = int(current_percentage / 100 * total_sec)
 
         if self.trans_to_sec(begin_time) < current_sec < (total_sec - self.trans_to_sec(end_time)):
@@ -109,10 +141,10 @@ class AdaptiveIntroSkip(_PluginBase):
             return
 
         # 剧集在某集之后的所有剧集的item_id
-        next_episode_ids = get_next_episode_ids(item_id=event_info.item_id,
-                                                season_id=event_info.season_id,
-                                                episode_id=event_info.episode_id
-                                                )
+        next_episode_ids = self._skip_helper.get_next_episode_ids(item_id=event_info.item_id,
+                                                                   season_id=event_info.season_id,
+                                                                   episode_id=event_info.episode_id
+                                                                   )
         if next_episode_ids:
             # 存储最新片头位置，新集入库使用本数据
             space_idx = event_info.item_name.index(' S')
@@ -125,7 +157,7 @@ class AdaptiveIntroSkip(_PluginBase):
                 intro_end = self.trans_to_sec(begin_time) if manual else current_sec
                 # 批量标记之后的所有剧集，不影响已经看过的标记
                 for next_episode_id in next_episode_ids:
-                    update_intro(next_episode_id, intro_end)
+                    self._skip_helper.update_intro(next_episode_id, intro_end)
                 chapter_info['intro_end'] = intro_end
                 logger.info(
                     f"【恢复播放】{event_info.item_name} 后续剧集片头设置在 {int(intro_end / 60)}分{int(intro_end % 60)}秒 结束")
@@ -134,7 +166,7 @@ class AdaptiveIntroSkip(_PluginBase):
                     total_sec - self.trans_to_sec(end_time)) and event_info.event == 'playback.stop') or manual:
                 credits_start = (total_sec - self.trans_to_sec(end_time)) if manual else current_sec
                 for next_episode_id in next_episode_ids:
-                    update_credits(next_episode_id, credits_start)
+                    self._skip_helper.update_credits(next_episode_id, credits_start)
                 chapter_info['credits_start'] = credits_start
                 logger.info(
                     f"【退出播放】{event_info.item_name} 后续剧集片尾设置在 {int(credits_start / 60)}分{int(credits_start % 60)}秒 开始")
@@ -177,9 +209,9 @@ class AdaptiveIntroSkip(_PluginBase):
             logger.info(f'【新集入库】{series_name} 休眠10s，等待媒体入库...')
             threading_event.wait(10)
             # 新入库剧集的item_id
-            next_episode_ids = get_next_episode_ids(item_id=chapter_info.get("item_id"),
-                                                    season_id=event_info.begin_season,
-                                                    episode_id=event_info.begin_episode)
+            next_episode_ids = self._skip_helper.get_next_episode_ids(item_id=chapter_info.get("item_id"),
+                                                                       season_id=event_info.begin_season,
+                                                                       episode_id=event_info.begin_episode)
             if next_episode_ids:
                 break
             cnt += 1
@@ -193,13 +225,13 @@ class AdaptiveIntroSkip(_PluginBase):
         # 批量标记新入库的剧集
         intro_end = chapter_info.get("intro_end")
         for next_episode_id in next_episode_ids:
-            update_intro(next_episode_id, intro_end)
+            self._skip_helper.update_intro(next_episode_id, intro_end)
         logger.info(
             f"【新集入库】{series_name} {event_info.season_episode} ，片头设置在 {int(intro_end / 60)}分{int(intro_end % 60)}秒 结束")
 
         credits_start = chapter_info.get("credits_start")
         for next_episode_id in next_episode_ids:
-            update_credits(next_episode_id, credits_start)
+            self._skip_helper.update_credits(next_episode_id, credits_start)
         logger.info(
             f"【新集入库】{series_name} {event_info.season_episode} ，片尾设置在 {int(credits_start / 60)}分{int(intro_end % 60)}秒 开始")
 
@@ -282,13 +314,13 @@ class AdaptiveIntroSkip(_PluginBase):
                                 },
                                 'content': [
                                     {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'user',
-                                            'label': '媒体库用户名',
-                                            'placeholder': '多个以,分隔 留空默认全部用户',
-                                        }
-                                    }
+                                                'component': 'VTextField',
+                                                'props': {
+                                                    'model': 'user',
+                                                    'label': '媒体库用户名',
+                                                    'placeholder': '多个以,分隔 留空默认全部用户',
+                                                }
+                                            }
                                 ]
                             }, {
                                 'component': 'VCol',
@@ -298,13 +330,13 @@ class AdaptiveIntroSkip(_PluginBase):
                                 },
                                 'content': [
                                     {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'exclude',
-                                            'label': '媒体路径排除关键词',
-                                            'placeholder': '多个关键词以,分隔',
-                                        }
-                                    }
+                                                'component': 'VTextField',
+                                                'props': {
+                                                    'model': 'exclude',
+                                                    'label': '媒体路径排除关键词',
+                                                    'placeholder': '多个关键词以,分隔',
+                                                }
+                                            }
                                 ]
                             }, {
                                 'component': 'VCol',
@@ -351,6 +383,40 @@ class AdaptiveIntroSkip(_PluginBase):
                     {
                         'component': 'VRow',
                         'content': [
+                            {
+                                'component': 'VRow',
+                                'content': [
+                                    {
+                                        'component': 'VCol',
+                                        'props': {
+                                            'cols': 12,
+                                            'md': 4
+                                        },
+                                        'content': [
+                                            {
+                                                'component': 'VSelect',
+                                                'props': {
+                                                    'multiple': True,
+                                                    'chips': True,
+                                                    'clearable': True,
+                                                    'model': 'mediaservers',
+                                                    'label': '媒体服务器',
+                                                    'items': [
+                                                        {
+                                                            'title': config.name,
+                                                            'value': config.name,
+                                                        }
+                                                        for config in self._mediaserver_helper.get_configs().values()
+                                                        if config.type == 'emby' or config.type == 'jellyfin'
+                                                    ],
+                                                    'hint': '同时只能选择一个',
+                                                    'persistent-hint': True,
+                                                },
+                                            }
+                                        ]
+                                    }
+                                ]
+                            },
                             {
                                 'component': 'VCol',
                                 'props': {
@@ -415,7 +481,8 @@ class AdaptiveIntroSkip(_PluginBase):
             "include": '',
             "exclude": '',
             "spec": '',
-            "user": ''
+            "user": '',
+            "mediaservers": []
         }
 
     def get_state(self) -> bool:
