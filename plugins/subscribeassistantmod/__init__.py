@@ -53,7 +53,7 @@ class SubscribeAssistantMod(_PluginBase):
     # 作者主页
     author_url = "https://github.com/InfinityPacer"
     # 插件配置项ID前缀
-    plugin_config_prefix = "subscribeassistantmod_"
+    plugin_config_prefix = "subscribeassistantmodv3_"
     # 加载顺序
     plugin_order = 10
     # 可使用的用户级别
